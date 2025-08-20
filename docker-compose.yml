@@ -137,6 +137,36 @@ services:
       networks:
         - local
 
+    babelfish:
+      container_name: dd-babelfish
+      # Babelfish for PostgreSQL - SQL Server compatibility with TDS protocol
+      # Using rsubr/postgres-babelfish image (Amazon ECR not available)
+      image: rsubr/postgres-babelfish
+      restart: always
+      ports:
+        - '1434:1433'  # TDS protocol (SQL Server compatible)
+        - '5433:5432'  # PostgreSQL protocol (administrative)
+      expose:
+        - '1433'
+        - '5432'
+      environment:
+        - ACCEPT_EULA=Y
+        - POSTGRES_USER=babelfish_user
+        - POSTGRES_PASSWORD=12345678
+        - MSSQL_SA_PASSWORD=12345678
+        - PG_VERSION=13
+        - MSSQL_COMPATIBILITY_MODE=on
+      volumes:
+        - babelfish-data:/var/lib/postgresql/data:delegated
+      tty: true
+      networks:
+        - local
+      healthcheck:
+        test: ["CMD-SHELL", "sqlcmd -S localhost:1433 -U babelfish_user -P 12345678 -Q 'SELECT 1' || pg_isready -h localhost -p 5432"]
+        interval: 15s
+        timeout: 10s
+        retries: 10
+
 
 
 volumes:
@@ -145,6 +175,7 @@ volumes:
   clickhouse-data:
   vertica-data:
   mssql-data:
+  babelfish-data:
 
 networks:
   local:

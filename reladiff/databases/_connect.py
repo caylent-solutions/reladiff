@@ -5,6 +5,7 @@ from sqeleton.databases import Connect
 from .postgresql import PostgreSQL
 from .mysql import MySQL
 from .mssql import MsSQL
+from .babelfish import Babelfish
 from .oracle import Oracle
 from .snowflake import Snowflake
 from .bigquery import BigQuery
@@ -21,6 +22,7 @@ DATABASE_BY_SCHEME = {
     "postgresql": PostgreSQL,
     "mysql": MySQL,
     "mssql": MsSQL,
+    "babelfish": Babelfish,
     "oracle": Oracle,
     "redshift": Redshift,
     "snowflake": Snowflake,

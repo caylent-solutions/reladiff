@@ -16,7 +16,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - Start with: `docker-compose up mssql`  
   - URI: `mssql://sa:Password123!@localhost:1433/master`
   - Uses pymssql (FreeTDS) for ARM64 compatibility instead of pyodbc
-- **Multiple databases**: `docker-compose up mysql postgres mssql` to test cross-database functionality
+- **Babelfish Support**: SQL Server compatibility layer on PostgreSQL
+  - Start with: `docker-compose up babelfish`
+  - URI: `babelfish://sa:Password123!@localhost:1434/master`
+  - Uses TDS protocol with full T-SQL compatibility
+- **Multiple databases**: `docker-compose up mysql postgres mssql babelfish` to test cross-database functionality
 - **Custom connections**: Override `TEST_*_CONN_STRING` in `tests/local_settings.py`
 - **Run all tests**: `poetry run unittest-parallel -j 16` (recommended for 1000+ tests)
 - **Run individual test**: `poetry run python -m unittest -k <test_name>`
@@ -52,14 +56,14 @@ The main entry point is `diff_tables()` in `__init__.py` which automatically sel
 
 ### Key Components
 - **TableSegment** (`table_segment.py`): Represents a table or portion of a table with key columns, extra columns, and filtering constraints
-- **Database Adapters** (`databases/`): Database-specific implementations for 10+ databases (PostgreSQL, MySQL, Snowflake, BigQuery, etc.)
+- **Database Adapters** (`databases/`): Database-specific implementations for 10+ databases (PostgreSQL, MySQL, MSSQL, Babelfish, Snowflake, BigQuery, etc.)
 - **Thread Management** (`thread_utils.py`): Utilities for parallel processing across database connections
 - **CLI Interface** (`__main__.py`): Click-based command line interface with rich output formatting
 
 ### Database Connection System
 - **Connection Factory** (`databases/_connect.py`): Central connection management
 - **Base Classes** (`databases/base.py`): Abstract base classes for database implementations
-- **Per-Database Modules**: Each supported database has its own module (e.g., `postgresql.py`, `mysql.py`)
+- **Per-Database Modules**: Each supported database has its own module (e.g., `postgresql.py`, `mysql.py`, `mssql.py`, `babelfish.py`)
 
 ### Configuration System
 - **TOML Config** (`config.py`): Support for configuration files to manage complex connection settings
@@ -73,7 +77,7 @@ The main entry point is `diff_tables()` in `__init__.py` which automatically sel
 
 ### Testing Framework
 - **Multi-Database Testing**: Tests run against multiple database types using docker-compose
-- **Cross-Database Support**: Full MySQL ↔ PostgreSQL ↔ MSSQL ↔ DuckDB compatibility testing
+- **Cross-Database Support**: Full MySQL ↔ PostgreSQL ↔ MSSQL ↔ Babelfish ↔ DuckDB compatibility testing
 - **Parameterized Tests**: Extensive use of parameterized tests for database compatibility
 - **Integration Tests**: End-to-end testing with real database connections
 - **Performance Benchmarks**: Dedicated benchmarking tools for performance regression testing

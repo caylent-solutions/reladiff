@@ -63,6 +63,9 @@ poetry run unittest-parallel -j 4
 
 # 4. Test MSSQL specifically
 python -c "from reladiff import connect; conn = connect('mssql://sa:Password123!@localhost:1433/master'); print('MSSQL OK')"
+
+# 5. Test Babelfish (SQL Server compatibility via TDS protocol)
+python -c "from reladiff import connect; conn = connect('babelfish://sa:Password123!@localhost:1434/master'); print('Babelfish OK')"
 ```
 
 ### Cross-Database Testing
@@ -70,11 +73,14 @@ All combinations work on ARM64:
 - MySQL ↔ PostgreSQL ✅
 - MySQL ↔ MSSQL ✅  
 - PostgreSQL ↔ MSSQL ✅
+- PostgreSQL ↔ Babelfish ✅
+- MySQL ↔ Babelfish ✅
 - DuckDB ↔ All databases ✅
 
 ### Performance Notes
 - **DuckDB**: Native performance (in-memory)
 - **MySQL/PostgreSQL**: Native ARM64 containers, full performance
+- **Babelfish**: Native ARM64 performance (PostgreSQL-based)
 - **MSSQL**: Runs via emulation, ~10-20% performance impact acceptable for testing
 
 ## Troubleshooting
