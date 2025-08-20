@@ -16,12 +16,13 @@ class Mixin_MD5:
     
     def md5_as_int(self, s: str) -> str:
         """Convert MD5 hash to integer representation for Babelfish"""
-        # Use PostgreSQL's md5 function since Babelfish is built on PostgreSQL
-        return f"('x' || substring(md5({s}), 1, 16))::bit(64)::bigint"
+        # Use SQL Server syntax since Babelfish communicates via TDS protocol
+        return f"CONVERT(BIGINT, CONVERT(BINARY(8), HASHBYTES('MD5', {s}), 1))"
 
     def md5_as_hex(self, s: str) -> str:
         """Convert MD5 hash to hexadecimal string for Babelfish"""
-        return f"md5({s})"
+        # Use SQL Server syntax since Babelfish communicates via TDS protocol
+        return f"CONVERT(VARCHAR(32), HASHBYTES('MD5', {s}), 2)"
 
 
 class Mixin_NormalizeValue:
@@ -39,7 +40,8 @@ class Mixin_NormalizeValue:
     
     def normalize_boolean(self, value, coltype) -> str:
         """Normalize boolean values for Babelfish"""
-        return 'true' if value else 'false'
+        # Use SQL Server syntax since Babelfish communicates via TDS protocol
+        return '1' if value else '0'
 
 
 class Dialect(BaseDialect, Mixin_MD5, Mixin_NormalizeValue, ReladiffDialect):
@@ -103,8 +105,8 @@ class Dialect(BaseDialect, Mixin_MD5, Mixin_NormalizeValue, ReladiffDialect):
     
     def to_string(self, s: str) -> str:
         """Convert value to string representation for Babelfish"""
-        # Use CAST which works in both SQL Server and PostgreSQL contexts
-        return f"CAST({s} AS VARCHAR)"
+        # Use SQL Server syntax since Babelfish communicates via TDS protocol
+        return f"CAST({s} AS VARCHAR(MAX))"
     
     def set_timezone_to_utc(self) -> str:
         """Set session timezone to UTC for Babelfish"""
@@ -151,7 +153,7 @@ class Babelfish(ThreadedDatabase):
     def create_connection(self):
         """Create connection to Babelfish using TDS protocol via pymssql"""
         try:
-            # Connect to Babelfish using TDS protocol - same as MSSQL
+            # Use identical connection parameters as MSSQL adapter for consistency
             return pymssql.connect(
                 server=self.host,
                 user=self.user,
@@ -177,20 +179,20 @@ class Babelfish(ThreadedDatabase):
         else:
             schema, table = 'dbo', str(path)
             
-        # Use T-SQL system views available in Babelfish
+        # Use identical query format as MSSQL adapter for consistency
         return f"""
             SELECT 
-                c.column_name,
-                c.data_type,
+                COLUMN_NAME,
+                DATA_TYPE,
                 CASE 
-                    WHEN c.data_type LIKE '%time%' OR c.data_type LIKE '%date%' THEN 3
+                    WHEN DATA_TYPE LIKE '%time%' OR DATA_TYPE LIKE '%date%' THEN 3
                     ELSE NULL 
                 END as datetime_precision,
-                c.numeric_precision,
-                c.numeric_scale
-            FROM information_schema.columns c
-            WHERE c.table_schema = '{schema}' AND c.table_name = '{table}'
-            ORDER BY c.ordinal_position
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE
+            FROM INFORMATION_SCHEMA.COLUMNS 
+            WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}'
+            ORDER BY ORDINAL_POSITION
         """
     
     def _parse_table_name(self, path) -> tuple:
