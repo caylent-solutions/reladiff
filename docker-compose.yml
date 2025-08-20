@@ -116,6 +116,27 @@ services:
       networks:
       - local
 
+    mssql:
+      container_name: dd-mssql
+      image: mcr.microsoft.com/mssql/server:2022-latest
+      # Note: On ARM64 (Apple Silicon), this runs via emulation.
+      # For better performance, consider Azure SQL Edge:
+      # image: mcr.microsoft.com/azure-sql-edge:latest
+      restart: always
+      ports:
+        - '1433:1433'
+      expose:
+        - '1433'
+      environment:
+        - ACCEPT_EULA=Y
+        - MSSQL_SA_PASSWORD=Password123!
+        - MSSQL_PID=Developer
+      volumes:
+        - mssql-data:/var/opt/mssql:delegated
+      tty: true
+      networks:
+        - local
+
 
 
 volumes:
@@ -123,6 +144,7 @@ volumes:
   mysql-data:
   clickhouse-data:
   vertica-data:
+  mssql-data:
 
 networks:
   local:

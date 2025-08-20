@@ -11,10 +11,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Install in global context**: `pip install -e .` (alternative to poetry for development)
 
 ### Testing
-- At the bare minimum, you need MySQL to run the tests.  You can create a local MySQL instance using `docker-compose up mysql`. The URI for it will be `mysql://mysql:Password1@localhost/mysql`. 
-- If you're using a different server, make sure to update `TEST_MYSQL_CONN_STRING` in `tests/common.py`. For your convenience, we recommend creating `tests/local_settings.py`, and to override the value there.
-- You can also run a few servers at once. For example `docker-compose up mysql postgres presto`.  Make sure to update the appropriate `TEST_*_CONN_STRING`, so that it will be included in the tests.
-- **Run all tests**: `poetry run unittest-parallel -j 16` (recommended for speed with 1000+ tests)
+- **Minimum requirement**: MySQL. Create with `docker-compose up mysql`. URI: `mysql://mysql:Password1@localhost/mysql`
+- **MSSQL Support**: Available for all platforms including ARM64 (Apple Silicon)
+  - Start with: `docker-compose up mssql`  
+  - URI: `mssql://sa:Password123!@localhost:1433/master`
+  - Uses pymssql (FreeTDS) for ARM64 compatibility instead of pyodbc
+- **Multiple databases**: `docker-compose up mysql postgres mssql` to test cross-database functionality
+- **Custom connections**: Override `TEST_*_CONN_STRING` in `tests/local_settings.py`
+- **Run all tests**: `poetry run unittest-parallel -j 16` (recommended for 1000+ tests)
 - **Run individual test**: `poetry run python -m unittest -k <test_name>`
 - **Run with stop on first failure**: `poetry run python -m unittest -f`
 - **Enable debug mode**: Add `-d` flag to reladiff commands for debug output
@@ -69,8 +73,15 @@ The main entry point is `diff_tables()` in `__init__.py` which automatically sel
 
 ### Testing Framework
 - **Multi-Database Testing**: Tests run against multiple database types using docker-compose
+- **Cross-Database Support**: Full MySQL ↔ PostgreSQL ↔ MSSQL ↔ DuckDB compatibility testing
 - **Parameterized Tests**: Extensive use of parameterized tests for database compatibility
 - **Integration Tests**: End-to-end testing with real database connections
 - **Performance Benchmarks**: Dedicated benchmarking tools for performance regression testing
 
-This architecture enables efficient diffing of tables with billions of rows across different database systems while maintaining high performance and reliability.
+### Platform Compatibility
+- **ARM64 Support**: Full compatibility with Apple Silicon (M1/M2/M3) and ARM64 Linux
+- **MSSQL on ARM64**: Uses pymssql (FreeTDS) instead of pyodbc for native ARM64 support
+- **Docker Emulation**: x86_64 containers run via emulation on ARM64 when native images unavailable
+- **Cross-Platform Testing**: All database combinations work across x86_64 and ARM64 architectures
+
+This architecture enables efficient diffing of tables with billions of rows across different database systems while maintaining high performance and reliability on all platforms.

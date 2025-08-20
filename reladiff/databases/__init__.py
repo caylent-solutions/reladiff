@@ -2,6 +2,7 @@ from sqeleton.databases import MD5_HEXDIGITS, CHECKSUM_HEXDIGITS, QueryError, Co
 
 from .postgresql import PostgreSQL
 from .mysql import MySQL
+from .mssql import MsSQL
 from .oracle import Oracle
 from .snowflake import Snowflake
 from .bigquery import BigQuery

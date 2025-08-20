@@ -4,6 +4,7 @@ from sqeleton.databases import Connect
 
 from .postgresql import PostgreSQL
 from .mysql import MySQL
+from .mssql import MsSQL
 from .oracle import Oracle
 from .snowflake import Snowflake
 from .bigquery import BigQuery
@@ -19,6 +20,7 @@ from .duckdb import DuckDB
 DATABASE_BY_SCHEME = {
     "postgresql": PostgreSQL,
     "mysql": MySQL,
+    "mssql": MsSQL,
     "oracle": Oracle,
     "redshift": Redshift,
     "snowflake": Snowflake,
