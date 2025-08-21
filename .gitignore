@@ -184,6 +184,8 @@ yarn.lock
 
 # Avoid redundant copies in lambda directory
 lambda/reladiff/
+test-build/
+lambda/lambda-env/
 
 # CloudFormation outputs
 cloudformation-outputs.json

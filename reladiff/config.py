@@ -18,6 +18,7 @@ def _apply_config(config: Dict[str, Any], run_name: str, kw: Dict[str, Any]):
     # Load config
     databases = config.pop("database", {})
     runs = config.pop("run", {})
+    aws_config = config.pop("aws", {})
     if config:
         raise ConfigParseError(f"Unknown option(s): {config}")
 
@@ -70,6 +71,19 @@ def _apply_config(config: Dict[str, Any], run_name: str, kw: Dict[str, Any]):
         run_args[f"table{index}"] = table
         if threads is not None:
             run_args[f"threads{index}"] = int(threads)
+
+    # Apply AWS configuration if present
+    if aws_config and not kw.get("aws"):
+        # Use AWS config if not overridden by command line
+        if "queue_url" in aws_config:
+            run_args["aws"] = aws_config["queue_url"]
+        elif "auto" in aws_config and aws_config["auto"]:
+            run_args["aws"] = "auto"
+        elif "region" in aws_config:
+            # Set region for auto-discovery
+            import os
+            os.environ["AWS_DEFAULT_REGION"] = aws_config["region"]
+            run_args["aws"] = "auto"
 
     # Update keywords
     new_kw = dict(kw)  # Set defaults

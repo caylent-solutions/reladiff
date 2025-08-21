@@ -58,6 +58,30 @@ Requires Python 3.8+ with pip.
 
 We advise to install it within a virtual-env.
 
+#### Database-Specific Dependencies
+
+For specific databases, you may need to install additional dependencies:
+
+```bash
+# PostgreSQL support
+pip install reladiff[postgresql]
+
+# MySQL support  
+pip install reladiff[mysql]
+
+# Microsoft SQL Server support
+pip install reladiff[mssql]
+
+# Babelfish for PostgreSQL support
+pip install reladiff[babelfish]
+
+# Snowflake support
+pip install reladiff[snowflake]
+
+# All database support
+pip install reladiff[all]
+```
+
 ### How to Use
 
 Once you've installed Reladiff, you can run it from the command-line:

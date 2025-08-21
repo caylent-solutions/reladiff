@@ -84,9 +84,149 @@ class MyHelpFormatter(click.HelpFormatter):
         self.write(f"  * In-db diff:    {prog} <database_a> <table_a> <table_b> [OPTIONS]\n")
         self.write(f"  * Cross-db diff: {prog} <database_a> <table_a> <database_b> <table_b> [OPTIONS]\n")
         self.write(f"  * Using config:  {prog} --conf PATH [--run NAME] [OPTIONS]\n")
+        self.write(f"  * AWS Lambda:    {prog} <database_a> <table_a> <database_b> <table_b> --aws auto [OPTIONS]\n")
 
 
 click.Context.formatter_class = MyHelpFormatter
+
+
+def _discover_aws_queue():
+    """Discover the AWS SQS queue URL from deployed CloudFormation stack."""
+    try:
+        import boto3
+        
+        # Try to find a deployed reladiff stack
+        cf_client = boto3.client('cloudformation')
+        
+        # Look for reladiff stacks
+        stacks = cf_client.list_stacks(StackStatusFilter=['CREATE_COMPLETE', 'UPDATE_COMPLETE'])
+        reladiff_stacks = [
+            stack for stack in stacks['StackSummaries'] 
+            if stack['StackName'].startswith('reladiff-serverless-')
+        ]
+        
+        if not reladiff_stacks:
+            raise ValueError("No deployed reladiff-serverless stacks found")
+        
+        # Use the first available stack (or dev if exists)
+        stack_name = next(
+            (stack['StackName'] for stack in reladiff_stacks if 'dev' in stack['StackName']),
+            reladiff_stacks[0]['StackName']
+        )
+        
+        # Get stack outputs
+        stack = cf_client.describe_stacks(StackName=stack_name)
+        outputs = {
+            output['OutputKey']: output['OutputValue'] 
+            for output in stack['Stacks'][0].get('Outputs', [])
+        }
+        
+        if 'CoordinatorQueueUrl' not in outputs:
+            raise ValueError(f"Stack {stack_name} does not have CoordinatorQueueUrl output")
+        
+        logging.info(f"Auto-discovered queue from stack: {stack_name}")
+        return outputs['CoordinatorQueueUrl'], outputs.get('ApiEndpoint')
+        
+    except Exception as e:
+        raise ValueError(f"Failed to auto-discover AWS queue: {e}")
+
+
+def _submit_to_aws(**kwargs):
+    """Submit a diff job to AWS Lambda infrastructure."""
+    try:
+        import boto3
+        import uuid
+        import json
+        from datetime import datetime
+    except ImportError:
+        logging.error("boto3 is required for AWS functionality. Install with: pip install boto3")
+        return
+    
+    aws_param = kwargs.pop('aws')
+    
+    # Auto-discover queue if needed
+    if aws_param == 'auto':
+        queue_url, api_endpoint = _discover_aws_queue()
+    else:
+        queue_url = aws_param
+        api_endpoint = None
+    
+    # Generate unique job ID
+    job_id = f"reladiff-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{str(uuid.uuid4())[:8]}"
+    
+    # Prepare job payload
+    job_payload = {
+        "job_id": job_id,
+        "table1": {
+            "database_uri": kwargs['database1'],
+            "table_name": kwargs['table1'],
+            "key_columns": list(kwargs['key_columns']) if kwargs['key_columns'] else ["id"],
+        },
+        "table2": {
+            "database_uri": kwargs['database2'],
+            "table_name": kwargs['table2'],
+            "key_columns": list(kwargs['key_columns']) if kwargs['key_columns'] else ["id"],
+        },
+        "options": {
+            "update_column": kwargs.get('update_column'),
+            "extra_columns": list(kwargs['columns']) if kwargs['columns'] else [],
+            "limit": kwargs.get('limit'),
+            "algorithm": kwargs.get('algorithm', 'auto'),
+            "bisection_factor": kwargs.get('bisection_factor', DEFAULT_BISECTION_FACTOR),
+            "bisection_threshold": kwargs.get('bisection_threshold', DEFAULT_BISECTION_THRESHOLD),
+            "min_age": kwargs.get('min_age'),
+            "max_age": kwargs.get('max_age'),
+            "stats": kwargs.get('stats', False),
+            "case_sensitive": kwargs.get('case_sensitive', False),
+            "where": kwargs.get('where'),
+            "assume_unique_key": kwargs.get('assume_unique_key', False),
+            "skip_sort_results": kwargs.get('skip_sort_results', False),
+            "table_write_limit": kwargs.get('table_write_limit', TABLE_WRITE_LIMIT),
+            "allow_empty_tables": kwargs.get('allow_empty_tables', False),
+            "materialize_to_table": kwargs.get('materialize_to_table'),
+            "threads1": kwargs.get('threads1'),
+            "threads2": kwargs.get('threads2'),
+        }
+    }
+    
+    # Remove None values to keep payload clean
+    def clean_dict(d):
+        if isinstance(d, dict):
+            return {k: clean_dict(v) for k, v in d.items() if v is not None}
+        return d
+    
+    job_payload = clean_dict(job_payload)
+    
+    if kwargs.get('debug'):
+        logging.debug(f"Job payload: {json.dumps(job_payload, indent=2)}")
+    
+    # Submit to SQS
+    try:
+        sqs = boto3.client('sqs')
+        
+        response = sqs.send_message(
+            QueueUrl=queue_url,
+            MessageBody=json.dumps(job_payload),
+            MessageGroupId='reladiff-jobs',
+            MessageDeduplicationId=job_id
+        )
+        
+        print(f"✅ Job submitted successfully!")
+        print(f"   Job ID: {job_id}")
+        print(f"   Queue: {queue_url}")
+        print(f"   Message ID: {response['MessageId']}")
+        
+        if api_endpoint:
+            print(f"   Monitor at: {api_endpoint.replace('/dev', '/dev/status')}?job_id={job_id}")
+        
+        print(f"\nTo check status:")
+        print(f"   aws logs tail /aws/lambda/reladiff-coordinator-dev --follow")
+        
+        return 0
+        
+    except Exception as e:
+        logging.error(f"Failed to submit job to AWS: {e}")
+        return 1
 
 
 @click.command(no_args_is_help=True)
@@ -212,6 +352,12 @@ click.Context.formatter_class = MyHelpFormatter
     help="Name of run-configuration to run. If used, CLI arguments for database and table must be omitted.",
     metavar="NAME",
 )
+@click.option(
+    "--aws",
+    default=None,
+    help="Submit job to AWS Lambda instead of running locally. Use 'auto' to discover from deployed stack, or specify SQS queue URL.",
+    metavar="QUEUE_URL",
+)
 def main(conf, run, **kw):
     if kw["table2"] is None and kw["database2"]:
         # Use the "database table table" form
@@ -259,6 +405,7 @@ def _main(
     table_write_limit,
     allow_empty_tables,
     materialize_to_table,
+    aws=None,
     threads1=None,
     threads2=None,
     __conf__=None,
@@ -266,6 +413,37 @@ def _main(
     if version:
         print(f"v{__version__}")
         return
+
+    # Handle AWS Lambda submission
+    if aws:
+        return _submit_to_aws(
+            aws=aws,
+            database1=database1,
+            table1=table1,
+            database2=database2,
+            table2=table2,
+            key_columns=key_columns,
+            update_column=update_column,
+            columns=columns,
+            limit=limit,
+            algorithm=algorithm,
+            bisection_factor=bisection_factor,
+            bisection_threshold=bisection_threshold,
+            min_age=min_age,
+            max_age=max_age,
+            stats=stats,
+            debug=debug,
+            verbose=verbose,
+            case_sensitive=case_sensitive,
+            where=where,
+            assume_unique_key=assume_unique_key,
+            skip_sort_results=skip_sort_results,
+            table_write_limit=table_write_limit,
+            allow_empty_tables=allow_empty_tables,
+            materialize_to_table=materialize_to_table,
+            threads1=threads1,
+            threads2=threads2,
+        )
 
     if interactive:
         debug = True
