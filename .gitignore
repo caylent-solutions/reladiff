@@ -26,6 +26,8 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+release-*/
+.aws-sam/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -149,3 +151,86 @@ benchmark_*.png
 shell.env
 devcontainer-environment-variables.json
 .devcontainer/aws-profile-map.json
+
+# AWS Lambda and SAM
+.aws-sam/
+samconfig.toml
+packaged-template.yaml
+template-packaged.yaml
+lambda-deployment-*.zip
+lambda-package/
+
+# AWS credentials and configuration
+bedrock.env
+aws-config.toml
+*.pem
+*.key
+.aws/
+aws-exports.js
+
+# Local test and development files
+test_*.py
+*_test.py
+local_settings.py
+dev_config.toml
+test_config.toml
+
+# Lambda build artifacts
+build/
+.serverless/
+node_modules/
+package-lock.json
+yarn.lock
+
+# Avoid redundant copies in lambda directory
+lambda/reladiff/
+
+# CloudFormation outputs
+cloudformation-outputs.json
+stack-outputs.json
+
+# Terraform (if used)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+*.auto.tfvars
+
+# Local data files
+*.csv
+*.json.bak
+*.sql.bak
+test_data/
+sample_data/
+
+# IDE and editor files
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Logs and temporary files
+*.tmp
+*.temp
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage reports
+.nyc_output
+coverage/
+*.lcov
+
+# Performance and profiling
+*.prof
+*.pstats
+flamegraph.svg
