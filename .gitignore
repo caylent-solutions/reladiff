@@ -236,3 +236,7 @@ coverage/
 *.prof
 *.pstats
 flamegraph.svg
+
+# Script Outputs
+debug/
+out/
