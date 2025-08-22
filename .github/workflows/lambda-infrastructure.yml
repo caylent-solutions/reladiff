@@ -1,0 +1,314 @@
+name: Lambda Infrastructure Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Infrastructure action'
+        required: true
+        type: choice
+        options:
+          - 'deploy'
+          - 'update'
+          - 'destroy'
+          - 'status'
+      stack_name:
+        description: 'CloudFormation stack name'
+        required: false
+        default: 'reladiff-serverless-dev'
+        type: string
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'dev'
+        type: choice
+        options:
+          - 'dev'
+          - 'staging'
+          - 'prod'
+      notification_email:
+        description: 'Email for notifications (optional)'
+        required: false
+        type: string
+      vpc_config:
+        description: 'Enable VPC configuration'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: ${{ github.event.inputs.stack_name || 'reladiff-serverless-dev' }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  infrastructure-management:
+    name: Manage Lambda Infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install SAM CLI
+        run: |
+          pip install aws-sam-cli
+          sam --version
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Check stack status
+        id: stack_status
+        run: |
+          set +e
+          STATUS=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].StackStatus' --output text 2>/dev/null)
+          EXIT_CODE=$?
+          set -e
+          
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "stack_exists=true" >> $GITHUB_OUTPUT
+            echo "stack_status=$STATUS" >> $GITHUB_OUTPUT
+            echo "Stack exists with status: $STATUS"
+          else
+            echo "stack_exists=false" >> $GITHUB_OUTPUT
+            echo "stack_status=NOT_FOUND" >> $GITHUB_OUTPUT
+            echo "Stack does not exist"
+          fi
+          
+      - name: Validate SAM template
+        if: github.event.inputs.action != 'destroy' && github.event.inputs.action != 'status'
+        run: |
+          sam validate --region ${{ env.AWS_REGION }}
+          echo "✅ SAM template validation passed"
+          
+      - name: Build SAM application
+        if: github.event.inputs.action != 'destroy' && github.event.inputs.action != 'status'
+        run: |
+          sam build --use-container
+          echo "✅ SAM application built successfully"
+          
+      - name: Deploy infrastructure
+        if: github.event.inputs.action == 'deploy' || github.event.inputs.action == 'update'
+        run: |
+          # Prepare parameters
+          PARAMS="Environment=${{ env.ENVIRONMENT }}"
+          
+          if [[ "${{ github.event.inputs.notification_email }}" != "" ]]; then
+            PARAMS="$PARAMS NotificationEmail=${{ github.event.inputs.notification_email }}"
+          fi
+          
+          if [[ "${{ github.event.inputs.vpc_config }}" == "true" ]]; then
+            # Get default VPC and subnets (for demo purposes)
+            VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
+            SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[0:2].SubnetId' --output text | tr '\t' ',')
+            SG_ID=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=default" --query 'SecurityGroups[0].GroupId' --output text)
+            
+            PARAMS="$PARAMS VpcId=$VPC_ID SubnetIds=$SUBNETS SecurityGroupIds=$SG_ID"
+          fi
+          
+          # Deploy the stack
+          sam deploy \
+            --stack-name ${{ env.STACK_NAME }} \
+            --resolve-s3 \
+            --capabilities CAPABILITY_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --parameter-overrides $PARAMS \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+            
+          echo "✅ Infrastructure deployment completed"
+          
+      - name: Get stack outputs
+        if: steps.stack_status.outputs.stack_exists == 'true' && github.event.inputs.action != 'destroy'
+        run: |
+          echo "## 📋 Stack Outputs" >> $GITHUB_STEP_SUMMARY
+          
+          aws cloudformation describe-stacks \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Stacks[0].Outputs[].[OutputKey,OutputValue,Description]' \
+            --output table >> stack_outputs.txt
+            
+          cat stack_outputs.txt >> $GITHUB_STEP_SUMMARY
+          
+          # Extract key values for use in other steps
+          API_ENDPOINT=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' --output text)
+          RESULTS_BUCKET=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].Outputs[?OutputKey==`ResultsBucket`].OutputValue' --output text)
+          
+          echo "api_endpoint=$API_ENDPOINT" >> $GITHUB_OUTPUT
+          echo "results_bucket=$RESULTS_BUCKET" >> $GITHUB_OUTPUT
+          
+      - name: Test Lambda functions
+        if: (github.event.inputs.action == 'deploy' || github.event.inputs.action == 'update') && steps.stack_status.outputs.stack_exists == 'true'
+        run: |
+          echo "## 🧪 Lambda Function Tests" >> $GITHUB_STEP_SUMMARY
+          
+          # Test table populator function
+          echo "Testing table populator function..." >> $GITHUB_STEP_SUMMARY
+          POPULATOR_RESULT=$(aws lambda invoke \
+            --function-name reladiff-table-populator-${{ env.ENVIRONMENT }} \
+            --region ${{ env.AWS_REGION }} \
+            --payload '{"database_config": {"driver": "test://connection"}, "dataset_size": "1m"}' \
+            --cli-binary-format raw-in-base64-out \
+            populator_output.json 2>&1 || echo "Function test failed")
+            
+          echo "Populator test result: $POPULATOR_RESULT" >> $GITHUB_STEP_SUMMARY
+          
+          # Test benchmark executor function
+          echo "Testing benchmark executor function..." >> $GITHUB_STEP_SUMMARY
+          EXECUTOR_RESULT=$(aws lambda invoke \
+            --function-name reladiff-benchmark-executor-${{ env.ENVIRONMENT }} \
+            --region ${{ env.AWS_REGION }} \
+            --payload '{"database_configs": {"test": {"driver": "test://connection"}}}' \
+            --cli-binary-format raw-in-base64-out \
+            executor_output.json 2>&1 || echo "Function test failed")
+            
+          echo "Executor test result: $EXECUTOR_RESULT" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Destroy infrastructure
+        if: github.event.inputs.action == 'destroy'
+        run: |
+          if [[ "${{ steps.stack_status.outputs.stack_exists }}" == "true" ]]; then
+            echo "🗑️ Destroying stack: ${{ env.STACK_NAME }}"
+            
+            # Empty S3 bucket first
+            RESULTS_BUCKET=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].Outputs[?OutputKey==`ResultsBucket`].OutputValue' --output text 2>/dev/null || echo "")
+            
+            if [[ "$RESULTS_BUCKET" != "" ]]; then
+              echo "Emptying S3 bucket: $RESULTS_BUCKET"
+              aws s3 rm s3://$RESULTS_BUCKET --recursive || true
+            fi
+            
+            # Delete the stack
+            aws cloudformation delete-stack --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }}
+            
+            # Wait for deletion to complete
+            echo "Waiting for stack deletion to complete..."
+            aws cloudformation wait stack-delete-complete --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }}
+            
+            echo "✅ Infrastructure destroyed successfully"
+          else
+            echo "Stack does not exist, nothing to destroy"
+          fi
+          
+      - name: Generate infrastructure status report
+        if: always()
+        run: |
+          echo "# 🏗️ Infrastructure Status Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Stack Name:** ${{ env.STACK_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get current stack status
+          set +e
+          CURRENT_STATUS=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].StackStatus' --output text 2>/dev/null)
+          EXIT_CODE=$?
+          set -e
+          
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "**Current Status:** $CURRENT_STATUS" >> $GITHUB_STEP_SUMMARY
+            
+            # List Lambda functions
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 📦 Lambda Functions" >> $GITHUB_STEP_SUMMARY
+            aws lambda list-functions --region ${{ env.AWS_REGION }} --query 'Functions[?starts_with(FunctionName, `reladiff-`)].{Name:FunctionName,Runtime:Runtime,MemorySize:MemorySize,Timeout:Timeout}' --output table >> $GITHUB_STEP_SUMMARY
+            
+          else
+            echo "**Current Status:** NOT_FOUND" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+      - name: Upload deployment artifacts
+        if: github.event.inputs.action != 'destroy'
+        uses: actions/upload-artifact@v3
+        with:
+          name: infrastructure-deployment-${{ github.run_number }}
+          path: |
+            .aws-sam/build/template.yaml
+            stack_outputs.txt
+            populator_output.json
+            executor_output.json
+          retention-days: 7
+
+  cost-monitoring:
+    name: Cost and Usage Monitoring
+    runs-on: ubuntu-latest
+    needs: infrastructure-management
+    if: github.event.inputs.action != 'destroy'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Generate cost report
+        run: |
+          echo "# 💰 Cost and Usage Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Get current month costs for Lambda
+          CURRENT_MONTH=$(date +%Y-%m-01)
+          NEXT_MONTH=$(date -d "+1 month" +%Y-%m-01)
+          
+          # Lambda costs
+          LAMBDA_COST=$(aws ce get-cost-and-usage \
+            --time-period Start=$CURRENT_MONTH,End=$NEXT_MONTH \
+            --granularity MONTHLY \
+            --metrics BlendedCost \
+            --group-by Type=DIMENSION,Key=SERVICE \
+            --filter file:///dev/stdin << EOF | jq -r '.ResultsByTime[0].Groups[] | select(.Keys[0] == "AWS Lambda") | .Metrics.BlendedCost.Amount // "0"'
+          {
+            "Dimensions": {
+              "Key": "SERVICE",
+              "Values": ["AWS Lambda"]
+            }
+          }
+          EOF
+          )
+          
+          # S3 costs
+          S3_COST=$(aws ce get-cost-and-usage \
+            --time-period Start=$CURRENT_MONTH,End=$NEXT_MONTH \
+            --granularity MONTHLY \
+            --metrics BlendedCost \
+            --group-by Type=DIMENSION,Key=SERVICE \
+            --filter file:///dev/stdin << EOF | jq -r '.ResultsByTime[0].Groups[] | select(.Keys[0] == "Amazon Simple Storage Service") | .Metrics.BlendedCost.Amount // "0"'
+          {
+            "Dimensions": {
+              "Key": "SERVICE",
+              "Values": ["Amazon Simple Storage Service"]
+            }
+          }
+          EOF
+          )
+          
+          echo "## Current Month Costs" >> $GITHUB_STEP_SUMMARY
+          echo "- **Lambda:** \$${LAMBDA_COST}" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3:** \$${S3_COST}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Lambda function metrics
+          echo "## Lambda Function Usage (Last 7 Days)" >> $GITHUB_STEP_SUMMARY
+          aws logs insights start-query \
+            --region ${{ env.AWS_REGION }} \
+            --log-group-names "/aws/lambda/reladiff-table-populator-${{ env.ENVIRONMENT }}" "/aws/lambda/reladiff-benchmark-executor-${{ env.ENVIRONMENT }}" \
+            --start-time $(date -d '7 days ago' +%s) \
+            --end-time $(date +%s) \
+            --query-string 'fields @timestamp, @duration, @billedDuration, @memorySize, @maxMemoryUsed | filter @type = "REPORT" | stats count() by bin(5m)' \
+            > query_id.json || echo "No logs available"

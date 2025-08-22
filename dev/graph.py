@@ -7,7 +7,7 @@
 
 import pandas as pd
 import plotly.graph_objects as go
-from reladiff.utils import number_to_human
+from sqeleton.utils import number_to_human
 import glob
 
 for benchmark_file in glob.glob("benchmark_*.jsonl"):
@@ -16,7 +16,7 @@ for benchmark_file in glob.glob("benchmark_*.jsonl"):
     sha = benchmark_file.split("_")[1].split(".")[0]
     print(f"Generating graphs from {benchmark_file}..")
 
-    for n_rows, group in rows.groupby(["rows"]):
+    for n_rows, group in rows.groupby("rows"):
         image_path = f"benchmark_{sha}_{number_to_human(n_rows)}.png"
         print(f"\t rows: {number_to_human(n_rows)}, image: {image_path}")
 
@@ -53,4 +53,15 @@ for benchmark_file in glob.glob("benchmark_*.jsonl"):
         fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
         fig.update_layout(uniformtext_minsize=2, uniformtext_mode="hide")
         fig.update_yaxes(title="Time")
-        fig.write_image(image_path, scale=2)
+        # Save as HTML instead of PNG to avoid Chrome dependency
+        html_path = image_path.replace('.png', '.html')
+        fig.write_html(html_path)
+        print(f"\t\t Saved as HTML: {html_path}")
+        
+        # Also try to save as PNG but catch any errors
+        try:
+            fig.write_image(image_path, scale=2)
+            print(f"\t\t Saved as PNG: {image_path}")
+        except Exception as e:
+            print(f"\t\t PNG export failed (Chrome/dependencies missing): {e}")
+            print(f"\t\t HTML version available at: {html_path}")

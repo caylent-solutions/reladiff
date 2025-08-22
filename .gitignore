@@ -135,8 +135,7 @@ ml-25m*
 ratings*.csv
 drive
 mysqltuner.pl
-benchmark_*.jsonl
-benchmark_*.png
+# Note: benchmark output files are now organized in out/ directory
 
 # Mac
 .DS_Store
@@ -237,6 +236,6 @@ coverage/
 *.pstats
 flamegraph.svg
 
-# Script Outputs
+# Script Outputs and organized output directories
 debug/
 out/

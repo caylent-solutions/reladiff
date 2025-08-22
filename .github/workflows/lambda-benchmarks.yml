@@ -1,0 +1,569 @@
+name: Lambda Benchmarks
+
+on:
+  # Manual trigger for on-demand benchmarking
+  workflow_dispatch:
+    inputs:
+      dataset_size:
+        description: 'Dataset size to benchmark'
+        required: true
+        default: '1m'
+        type: choice
+        options:
+          - '1m'
+          - '25m'
+      test_filter:
+        description: 'Specific tests to run (comma-separated, leave empty for all)'
+        required: false
+        type: string
+      generate_graphs:
+        description: 'Generate performance graphs'
+        required: false
+        default: true
+        type: boolean
+      stack_name:
+        description: 'CloudFormation stack name'
+        required: false
+        default: 'reladiff-serverless-dev'
+        type: string
+      
+  # Scheduled benchmarks
+  schedule:
+    # Run weekly benchmarks on Sunday at 2 AM UTC
+    - cron: '0 2 * * 0'
+
+  # Run benchmarks on releases
+  release:
+    types: [published]
+
+  # Run benchmarks on main branch pushes that affect core diff logic
+  push:
+    branches: [main, master]
+    paths:
+      - 'reladiff/**'
+      - 'lambda/**'
+      - 'pyproject.toml'
+      - '.github/workflows/lambda-benchmarks.yml'
+
+  # Run benchmarks on PRs that affect core logic
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'reladiff/**'
+      - 'lambda/**'
+      - 'pyproject.toml'
+
+env:
+  AWS_REGION: us-east-1
+  STACK_NAME: ${{ github.event.inputs.stack_name || 'reladiff-serverless-dev' }}
+
+jobs:
+  benchmark-1m:
+    name: Benchmark 1M Dataset
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ github.event.inputs.dataset_size != '25m' || github.event_name != 'workflow_dispatch' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          
+      - name: Load cached venv
+        id: cache-poetry-deps
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+          
+      - name: Install dependencies
+        if: steps.cache-poetry-deps.outputs.cache-hit != 'true'
+        run: poetry install --no-interaction --no-root
+        
+      - name: Install project
+        run: poetry install --no-interaction
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Check Lambda deployment status
+        id: check_deployment
+        run: |
+          if aws lambda get-function --function-name reladiff-table-populator-dev --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "lambdas_deployed=true" >> $GITHUB_OUTPUT
+          else
+            echo "lambdas_deployed=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Deploy Lambda infrastructure
+        if: steps.check_deployment.outputs.lambdas_deployed == 'false'
+        run: |
+          # Install SAM CLI
+          pip install aws-sam-cli
+          
+          # Build and deploy
+          sam build
+          sam deploy --stack-name ${{ env.STACK_NAME }} --resolve-s3 --capabilities CAPABILITY_IAM --no-confirm-changeset
+          
+      - name: Execute 1M benchmark
+        id: benchmark_1m
+        run: |
+          # Determine test filter
+          TEST_FILTER=""
+          if [[ "${{ github.event.inputs.test_filter }}" != "" ]]; then
+            IFS=',' read -ra FILTERS <<< "${{ github.event.inputs.test_filter }}"
+            for filter in "${FILTERS[@]}"; do
+              TEST_FILTER="$TEST_FILTER --test-filter $(echo $filter | xargs)"
+            done
+          fi
+          
+          # Execute benchmark
+          poetry run python benchmark_lambda.py \
+            --dataset-size 1m \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            $TEST_FILTER
+            
+      - name: Generate performance graphs
+        if: ${{ github.event.inputs.generate_graphs != 'false' }}
+        run: |
+          # Download latest benchmark results
+          LATEST_CSV=$(poetry run python benchmark_lambda.py --download-results --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} | grep "Downloaded results to:" | cut -d' ' -f4)
+          
+          if [[ -f "$LATEST_CSV" ]]; then
+            # Generate graphs
+            poetry run python benchmark_lambda.py --generate-graphs --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }}
+            
+            # Find generated graph files
+            find . -name "*.png" -o -name "*.svg" | head -10
+          fi
+          
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: benchmark-results-1m-${{ github.run_number }}
+          path: |
+            benchmark_*.csv
+            *.png
+            *.svg
+          retention-days: 30
+          
+      - name: Upload results to S3
+        if: success()
+        run: |
+          # Get the results bucket
+          RESULTS_BUCKET=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].Outputs[?OutputKey==`ResultsBucket`].OutputValue' --output text)
+          
+          # Upload artifacts with GitHub metadata
+          if [[ -f "benchmark_*.csv" ]]; then
+            aws s3 cp benchmark_*.csv s3://$RESULTS_BUCKET/github-actions/${{ github.run_number }}/benchmark-1m.csv \
+              --metadata "github-run-id=${{ github.run_id }},github-sha=${{ github.sha }},github-ref=${{ github.ref }}"
+          fi
+          
+      - name: Comment on PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Find benchmark CSV file
+            const files = fs.readdirSync('.');
+            const csvFile = files.find(f => f.startsWith('benchmark_') && f.endsWith('.csv'));
+            
+            if (!csvFile) {
+              console.log('No benchmark results found');
+              return;
+            }
+            
+            // Parse CSV results
+            const csvContent = fs.readFileSync(csvFile, 'utf8');
+            const lines = csvContent.trim().split('\n');
+            const headers = lines[0].split(',');
+            const results = lines.slice(1).map(line => {
+              const values = line.split(',');
+              const result = {};
+              headers.forEach((header, i) => result[header] = values[i]);
+              return result;
+            });
+            
+            // Generate summary
+            const successful = results.filter(r => r.status === 'SUCCESS');
+            const failed = results.filter(r => r.status === 'FAILED');
+            
+            let summary = `## 🚀 Lambda Benchmark Results (1M Dataset)\n\n`;
+            summary += `**Overall:** ${successful.length}/${results.length} tests successful\n\n`;
+            
+            if (successful.length > 0) {
+              summary += `### ✅ Successful Tests\n`;
+              summary += `| Test | Duration (s) | Rows/sec | Memory (MB) | Diff Ops |\n`;
+              summary += `|------|-------------|----------|-------------|----------|\n`;
+              
+              successful.forEach(test => {
+                const duration = parseFloat(test.duration_seconds || 0).toFixed(2);
+                const rowsPerSec = parseInt(test.rows_per_second || 0).toLocaleString();
+                const memory = parseFloat(test.peak_memory_mb || 0).toFixed(1);
+                const diffOps = parseInt(test.diff_operations || 0).toLocaleString();
+                summary += `| ${test.test_name} | ${duration} | ${rowsPerSec} | ${memory} | ${diffOps} |\n`;
+              });
+              summary += `\n`;
+            }
+            
+            if (failed.length > 0) {
+              summary += `### ❌ Failed Tests\n`;
+              failed.forEach(test => {
+                summary += `- **${test.test_name}**: ${test.error || 'Unknown error'}\n`;
+              });
+              summary += `\n`;
+            }
+            
+            summary += `<details><summary>📊 Raw Results</summary>\n\n\`\`\`csv\n${csvContent}\n\`\`\`\n\n</details>`;
+            
+            // Comment on PR
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+  benchmark-25m:
+    name: Benchmark 25M Dataset
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    if: ${{ github.event.inputs.dataset_size == '25m' || (github.event_name == 'schedule' || github.event_name == 'release') }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          
+      - name: Load cached venv
+        id: cache-poetry-deps
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+          
+      - name: Install dependencies
+        if: steps.cache-poetry-deps.outputs.cache-hit != 'true'
+        run: poetry install --no-interaction --no-root
+        
+      - name: Install project
+        run: poetry install --no-interaction
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Check Lambda deployment status
+        id: check_deployment
+        run: |
+          if aws lambda get-function --function-name reladiff-table-populator-dev --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "lambdas_deployed=true" >> $GITHUB_OUTPUT
+          else
+            echo "lambdas_deployed=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Deploy Lambda infrastructure
+        if: steps.check_deployment.outputs.lambdas_deployed == 'false'
+        run: |
+          # Install SAM CLI
+          pip install aws-sam-cli
+          
+          # Build and deploy
+          sam build
+          sam deploy --stack-name ${{ env.STACK_NAME }} --resolve-s3 --capabilities CAPABILITY_IAM --no-confirm-changeset
+          
+      - name: Execute 25M benchmark
+        id: benchmark_25m
+        run: |
+          # Determine test filter
+          TEST_FILTER=""
+          if [[ "${{ github.event.inputs.test_filter }}" != "" ]]; then
+            IFS=',' read -ra FILTERS <<< "${{ github.event.inputs.test_filter }}"
+            for filter in "${FILTERS[@]}"; do
+              TEST_FILTER="$TEST_FILTER --test-filter $(echo $filter | xargs)"
+            done
+          fi
+          
+          # Execute benchmark
+          poetry run python benchmark_lambda.py \
+            --dataset-size 25m \
+            --stack-name ${{ env.STACK_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            $TEST_FILTER
+            
+      - name: Generate performance graphs
+        if: ${{ github.event.inputs.generate_graphs != 'false' }}
+        run: |
+          # Download latest benchmark results
+          LATEST_CSV=$(poetry run python benchmark_lambda.py --download-results --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} | grep "Downloaded results to:" | cut -d' ' -f4)
+          
+          if [[ -f "$LATEST_CSV" ]]; then
+            # Generate graphs
+            poetry run python benchmark_lambda.py --generate-graphs --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }}
+            
+            # Find generated graph files
+            find . -name "*.png" -o -name "*.svg" | head -10
+          fi
+          
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: benchmark-results-25m-${{ github.run_number }}
+          path: |
+            benchmark_*.csv
+            *.png
+            *.svg
+          retention-days: 30
+          
+      - name: Upload results to S3
+        if: success()
+        run: |
+          # Get the results bucket
+          RESULTS_BUCKET=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].Outputs[?OutputKey==`ResultsBucket`].OutputValue' --output text)
+          
+          # Upload artifacts with GitHub metadata
+          if [[ -f "benchmark_*.csv" ]]; then
+            aws s3 cp benchmark_*.csv s3://$RESULTS_BUCKET/github-actions/${{ github.run_number }}/benchmark-25m.csv \
+              --metadata "github-run-id=${{ github.run_id }},github-sha=${{ github.sha }},github-ref=${{ github.ref }}"
+          fi
+
+  performance-regression-check:
+    name: Performance Regression Analysis
+    runs-on: ubuntu-latest
+    needs: [benchmark-1m]
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Download current benchmark results
+        uses: actions/download-artifact@v3
+        with:
+          name: benchmark-results-1m-${{ github.run_number }}
+          path: ./current-results/
+          
+      - name: Get baseline benchmark from main branch
+        run: |
+          # Get the results bucket
+          RESULTS_BUCKET=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].Outputs[?OutputKey==`ResultsBucket`].OutputValue' --output text)
+          
+          # Try to find recent baseline results from main branch
+          aws s3 ls s3://$RESULTS_BUCKET/github-actions/ --recursive | grep benchmark-1m.csv | tail -5 | while read -r line; do
+            file=$(echo $line | awk '{print $4}')
+            aws s3 cp s3://$RESULTS_BUCKET/$file ./baseline-results/$(basename $file) || true
+          done
+          
+      - name: Analyze performance regression
+        run: |
+          python3 << 'EOF'
+          import csv
+          import json
+          import os
+          import glob
+          from typing import Dict, List
+          
+          def load_benchmark_results(file_path: str) -> Dict:
+              """Load benchmark results from CSV file"""
+              results = {}
+              try:
+                  with open(file_path, 'r') as f:
+                      reader = csv.DictReader(f)
+                      for row in reader:
+                          if row.get('status') == 'SUCCESS':
+                              results[row['test_name']] = {
+                                  'duration_seconds': float(row.get('duration_seconds', 0)),
+                                  'rows_per_second': float(row.get('rows_per_second', 0)),
+                                  'peak_memory_mb': float(row.get('peak_memory_mb', 0))
+                              }
+              except Exception as e:
+                  print(f"Error loading {file_path}: {e}")
+              return results
+          
+          def compare_results(current: Dict, baseline: Dict) -> Dict:
+              """Compare current results with baseline"""
+              comparison = {
+                  'regressions': [],
+                  'improvements': [],
+                  'new_tests': [],
+                  'missing_tests': []
+              }
+              
+              for test_name in current:
+                  if test_name not in baseline:
+                      comparison['new_tests'].append(test_name)
+                      continue
+                      
+                  curr = current[test_name]
+                  base = baseline[test_name]
+                  
+                  # Check duration regression (>20% slower)
+                  duration_ratio = curr['duration_seconds'] / base['duration_seconds'] if base['duration_seconds'] > 0 else 1
+                  if duration_ratio > 1.2:
+                      comparison['regressions'].append({
+                          'test': test_name,
+                          'metric': 'duration',
+                          'change': f"{(duration_ratio - 1) * 100:.1f}% slower",
+                          'current': curr['duration_seconds'],
+                          'baseline': base['duration_seconds']
+                      })
+                  elif duration_ratio < 0.8:
+                      comparison['improvements'].append({
+                          'test': test_name, 
+                          'metric': 'duration',
+                          'change': f"{(1 - duration_ratio) * 100:.1f}% faster",
+                          'current': curr['duration_seconds'],
+                          'baseline': base['duration_seconds']
+                      })
+              
+              for test_name in baseline:
+                  if test_name not in current:
+                      comparison['missing_tests'].append(test_name)
+                      
+              return comparison
+          
+          # Load current results
+          current_files = glob.glob('./current-results/benchmark_*.csv')
+          if not current_files:
+              print("No current benchmark results found")
+              exit(0)
+              
+          current_results = load_benchmark_results(current_files[0])
+          
+          # Load baseline results
+          baseline_files = glob.glob('./baseline-results/benchmark*.csv')
+          if not baseline_files:
+              print("No baseline benchmark results found - skipping regression analysis")
+              exit(0)
+              
+          baseline_results = load_benchmark_results(baseline_files[-1])  # Use most recent
+          
+          # Compare results
+          comparison = compare_results(current_results, baseline_results)
+          
+          # Generate summary
+          summary = f"## 📊 Performance Regression Analysis\n\n"
+          
+          if comparison['regressions']:
+              summary += f"### 🔴 Performance Regressions ({len(comparison['regressions'])} found)\n"
+              for reg in comparison['regressions']:
+                  summary += f"- **{reg['test']}** ({reg['metric']}): {reg['change']} ({reg['current']:.2f}s vs {reg['baseline']:.2f}s)\n"
+              summary += "\n"
+          
+          if comparison['improvements']:
+              summary += f"### 🟢 Performance Improvements ({len(comparison['improvements'])} found)\n"
+              for imp in comparison['improvements']:
+                  summary += f"- **{imp['test']}** ({imp['metric']}): {imp['change']} ({imp['current']:.2f}s vs {imp['baseline']:.2f}s)\n"
+              summary += "\n"
+              
+          if comparison['new_tests']:
+              summary += f"### 🆕 New Tests ({len(comparison['new_tests'])} found)\n"
+              for test in comparison['new_tests']:
+                  summary += f"- {test}\n"
+              summary += "\n"
+              
+          if comparison['missing_tests']:
+              summary += f"### ⚠️ Missing Tests ({len(comparison['missing_tests'])} found)\n"
+              for test in comparison['missing_tests']:
+                  summary += f"- {test}\n"
+              summary += "\n"
+          
+          if not any([comparison['regressions'], comparison['improvements'], comparison['new_tests'], comparison['missing_tests']]):
+              summary += "### ✅ No significant performance changes detected\n\n"
+          
+          # Save summary for GitHub comment
+          with open('regression_summary.md', 'w') as f:
+              f.write(summary)
+              
+          # Set exit code based on regressions
+          if comparison['regressions']:
+              print(f"❌ {len(comparison['regressions'])} performance regressions detected!")
+              exit(1)
+          else:
+              print("✅ No performance regressions detected")
+              exit(0)
+          EOF
+          
+      - name: Comment on PR with regression analysis
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            try {
+              const summary = fs.readFileSync('regression_summary.md', 'utf8');
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            } catch (error) {
+              console.log('No regression summary found');
+            }
+
+  cleanup:
+    name: Cleanup Resources
+    runs-on: ubuntu-latest
+    needs: [benchmark-1m, benchmark-25m]
+    if: always() && github.event_name == 'workflow_dispatch' && github.event.inputs.cleanup == 'true'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Clean up old S3 results
+        run: |
+          # Get the results bucket
+          RESULTS_BUCKET=$(aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --region ${{ env.AWS_REGION }} --query 'Stacks[0].Outputs[?OutputKey==`ResultsBucket`].OutputValue' --output text)
+          
+          # Delete results older than 30 days
+          aws s3api list-objects-v2 --bucket $RESULTS_BUCKET --prefix github-actions/ --query 'Contents[?LastModified<`'$(date -d '30 days ago' --iso-8601)'`].Key' --output text | xargs -I {} aws s3 rm s3://$RESULTS_BUCKET/{} || true

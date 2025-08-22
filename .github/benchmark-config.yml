@@ -1,0 +1,93 @@
+# Benchmark Configuration for GitHub Actions
+# This file defines different benchmark scenarios that can be executed
+
+scenarios:
+  # Quick smoke test - runs a subset of tests for fast validation
+  smoke_test:
+    dataset_size: "1m"
+    test_filter: 
+      - "postgresql_int_mysql_int"
+      - "mysql_int_mysql_int"
+    timeout_minutes: 30
+    description: "Quick smoke test with core database combinations"
+    
+  # Full compatibility test - runs all database combinations
+  full_test:
+    dataset_size: "1m"
+    test_filter: []  # empty = all tests
+    timeout_minutes: 60
+    description: "Complete test suite with all database combinations"
+    
+  # Large dataset test - for performance validation
+  large_dataset:
+    dataset_size: "25m"
+    test_filter: []
+    timeout_minutes: 180
+    description: "Large dataset performance test"
+    
+  # Cross-database focus - tests different database combinations
+  cross_database:
+    dataset_size: "1m"
+    test_filter:
+      - "postgresql_int_mysql_int"
+      - "mssql_int_postgresql_int"
+      - "babelfish_int_mysql_int"
+    timeout_minutes: 45
+    description: "Cross-database compatibility testing"
+    
+  # Performance regression - focused on timing-sensitive tests
+  performance_regression:
+    dataset_size: "1m"
+    test_filter:
+      - "postgresql_int_postgresql_int"
+      - "mysql_int_mysql_int"
+    timeout_minutes: 40
+    description: "Performance regression detection"
+
+# Default benchmark settings
+defaults:
+  stack_name: "reladiff-serverless-dev"
+  region: "us-east-1" 
+  generate_graphs: true
+  upload_results: true
+  
+# Performance thresholds for regression detection
+performance_thresholds:
+  duration_regression_percent: 20  # Fail if >20% slower
+  duration_improvement_percent: 20  # Report if >20% faster
+  memory_regression_percent: 30    # Fail if >30% more memory
+  throughput_regression_percent: 15 # Fail if >15% lower throughput
+
+# Notification settings
+notifications:
+  # Slack webhook for performance alerts (set in secrets)
+  slack_webhook_secret: "BENCHMARK_SLACK_WEBHOOK"
+  
+  # Email notifications for critical regressions
+  email_on_regression: true
+  
+  # GitHub issue creation for persistent failures
+  create_github_issue: true
+
+# Infrastructure settings  
+infrastructure:
+  # Lambda function configuration
+  lambda_memory_mb: 3008
+  lambda_timeout_seconds: 900
+  
+  # VPC configuration (optional)
+  enable_vpc: false
+  
+  # Cost monitoring
+  cost_alert_threshold_usd: 50.0
+  
+# Data retention policies
+retention:
+  # Keep benchmark results for 30 days
+  benchmark_results_days: 30
+  
+  # Keep GitHub artifacts for 7 days
+  github_artifacts_days: 7
+  
+  # Keep CloudWatch logs for 14 days
+  cloudwatch_logs_days: 14
