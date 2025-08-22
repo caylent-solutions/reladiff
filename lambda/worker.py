@@ -19,6 +19,7 @@ import traceback
 
 from reladiff import connect_to_table, diff_tables, Algorithm
 from reladiff.table_segment import TableSegment
+from reladiff.utils import Vector
 from secrets_utils import build_connection_uri
 
 logger = logging.getLogger(__name__)
@@ -82,15 +83,24 @@ class LambdaWorker:
         logger.info(f"Processing segment {segment_id} for job {job_id}")
         
         try:
+            # Convert list fields to tuples (JSON serialization converts tuples to lists)
+            key_columns = job['key_columns']
+            if isinstance(key_columns, list):
+                key_columns = tuple(key_columns)
+                
+            extra_columns = job.get('extra_columns', [])
+            if isinstance(extra_columns, list):
+                extra_columns = tuple(extra_columns)
+            
             # Connect to tables
-            table1 = self._create_table_segment(job['table1'], job['key_columns'])
-            table2 = self._create_table_segment(job['table2'], job['key_columns'])
+            table1 = self._create_table_segment(job['table1'], key_columns)
+            table2 = self._create_table_segment(job['table2'], key_columns)
             
             # Configure diff options
             diff_options = {
                 'algorithm': Algorithm(job['algorithm']),
-                'key_columns': job['key_columns'],
-                'extra_columns': job.get('extra_columns', []),
+                'key_columns': key_columns,
+                'extra_columns': extra_columns,
                 'threaded': job['options'].get('threaded', False),
                 'max_threadpool_size': job['options'].get('max_threadpool_size', 1),
                 'bisection_threshold': job['options'].get('bisection_threshold', 16000),
@@ -162,9 +172,18 @@ class LambdaWorker:
         
         # Apply segment bounds if specified
         if 'min_key' in table_config and 'max_key' in table_config:
+            # Convert list/tuple data from JSON back to Vector objects
+            min_key = table_config['min_key']
+            max_key = table_config['max_key']
+            
+            if isinstance(min_key, (list, tuple)):
+                min_key = Vector(min_key)
+            if isinstance(max_key, (list, tuple)):
+                max_key = Vector(max_key)
+                
             table = table.new_key_bounds(
-                min_key=table_config['min_key'],
-                max_key=table_config['max_key']
+                min_key=min_key,
+                max_key=max_key
             )
         
         # Apply where clause if specified

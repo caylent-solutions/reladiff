@@ -18,6 +18,7 @@ from datetime import datetime
 from reladiff import connect_to_table, diff_tables, Algorithm
 from reladiff.table_segment import TableSegment
 from reladiff.hashdiff_tables import DEFAULT_BISECTION_FACTOR, DEFAULT_BISECTION_THRESHOLD
+from reladiff.utils import Vector, safezip
 from secrets_utils import build_connection_uri
 
 
@@ -71,6 +72,22 @@ class LambdaCoordinator:
         logger.info(f"Successfully resolved database URI for {db_type} at {host}:{port}")
         # Don't log the actual URI with credentials for security
         return resolved_uri
+    
+    def _parse_key_range_result(self, key_types, key_range) -> Tuple[Vector, Vector]:
+        """Convert query_key_range result to Vector objects, similar to diff_tables._parse_key_range_result"""
+        if isinstance(key_range, Exception):
+            raise key_range
+
+        min_key_values, max_key_values = key_range
+
+        # Convert to Vector objects using key types
+        try:
+            min_key = Vector(key_type.make_value(mn) for key_type, mn in safezip(key_types, min_key_values))
+            max_key = Vector(key_type.make_value(mx) + 1 for key_type, mx in safezip(key_types, max_key_values))
+        except (TypeError, ValueError) as e:
+            raise type(e)(f"Cannot apply {key_types} to '{min_key_values}', '{max_key_values}'.") from e
+
+        return min_key, max_key
         
     def analyze_tables(self, table1_config: Dict, table2_config: Dict) -> Dict[str, Any]:
         """Analyze tables to determine optimal segmentation strategy"""
@@ -118,12 +135,51 @@ class LambdaCoordinator:
                 thread_count=1
             )
             
-            # Get table schemas and row counts
+            # Get table schemas and key types
             table1 = table1.with_schema()
             table2 = table2.with_schema()
+            key_types1 = table1.key_types
+            key_types2 = table2.key_types
             
-            size1 = table1.approximate_size()
-            size2 = table2.approximate_size()
+            # Query key ranges to determine bounds (needed for approximate_size)
+            try:
+                key_range1 = table1.query_key_range()
+                min_key1, max_key1 = self._parse_key_range_result(key_types1, key_range1)
+                logger.info(f"Table1 key range: {min_key1} to {max_key1}")
+            except Exception as e:
+                # Handle empty table case
+                logger.warning(f"Could not determine key range for table1: {e}")
+                if "empty" in str(e).lower():
+                    logger.info("Table1 appears to be empty, using table2 bounds")
+                    key_range2 = table2.query_key_range()
+                    min_key1, max_key1 = self._parse_key_range_result(key_types2, key_range2)
+                else:
+                    raise
+            
+            try:
+                key_range2 = table2.query_key_range()
+                min_key2, max_key2 = self._parse_key_range_result(key_types2, key_range2)
+                logger.info(f"Table2 key range: {min_key2} to {max_key2}")
+            except Exception as e:
+                # Handle empty table case  
+                logger.warning(f"Could not determine key range for table2: {e}")
+                if "empty" in str(e).lower():
+                    logger.info("Table2 appears to be empty, using table1 bounds")
+                    min_key2, max_key2 = min_key1, max_key1
+                else:
+                    raise
+            
+            # Use the wider bounds from both tables (Vector objects support comparison)
+            min_key = Vector(min(k1, k2) for k1, k2 in zip(min_key1, min_key2))
+            max_key = Vector(max(k1, k2) for k1, k2 in zip(max_key1, max_key2))
+            logger.info(f"Combined key range: {min_key} to {max_key}")
+            
+            # Create bounded tables for size calculation
+            btable1 = table1.new_key_bounds(min_key=min_key, max_key=max_key)
+            btable2 = table2.new_key_bounds(min_key=min_key, max_key=max_key)
+            
+            size1 = btable1.approximate_size()
+            size2 = btable2.approximate_size()
             max_size = max(size1, size2)
             
             # Determine algorithm
@@ -182,10 +238,19 @@ class LambdaCoordinator:
             thread_count=1
         ).with_schema()
         
-        # Get key ranges
-        key_ranges = [table1.query_key_range(), table2.query_key_range()]
-        min_key = min(kr[0] for kr in key_ranges)
-        max_key = max(kr[1] for kr in key_ranges)
+        # Get key ranges and convert to Vector objects
+        key_types1 = table1.key_types
+        key_types2 = table2.key_types
+        
+        key_range1 = table1.query_key_range()
+        key_range2 = table2.query_key_range()
+        
+        min_key1, max_key1 = self._parse_key_range_result(key_types1, key_range1)
+        min_key2, max_key2 = self._parse_key_range_result(key_types2, key_range2)
+        
+        # Use wider bounds from both tables
+        min_key = Vector(min(k1, k2) for k1, k2 in zip(min_key1, min_key2))
+        max_key = Vector(max(k1, k2) for k1, k2 in zip(max_key1, max_key2))
         
         # Create bounded tables
         bounded_table1 = table1.new_key_bounds(min_key=min_key, max_key=max_key)
@@ -324,6 +389,9 @@ def lambda_handler(event, context):
             options = event.get('options', {})
         
         logger.info(f"Starting coordination for job {job_id}")
+        logger.info(f"Table1 config: {table1_config}")
+        logger.info(f"Table2 config: {table2_config}")
+        logger.info(f"Options: {options}")
         
         # Analyze tables
         analysis = coordinator.analyze_tables(table1_config, table2_config)
