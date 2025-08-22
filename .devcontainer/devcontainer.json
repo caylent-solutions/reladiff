@@ -5,6 +5,7 @@
   "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
   "mounts": [
     "source=claude-code-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=${localEnv:HOME}/.claude/agents,target=/home/node/.claude/agents,type=bind,consistency=cached",
     "source=claude-code-config-${devcontainerId},target=/home/node/.claude,type=volume"
   ],
   "features": {
