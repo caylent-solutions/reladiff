@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Reladiff Benchmark Lambda Functions'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    Description: Environment name
+
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 3008
+    Timeout: 900
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        PYTHONPATH: /var/task:/var/task/reladiff
+        LOG_LEVEL: INFO
+
+Resources:
+  # S3 Bucket for results
+  BenchmarkResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'reladiff-benchmark-results-${Environment}-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldResults
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ECS Cluster for table population
+  BenchmarkECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'reladiff-benchmark-${Environment}'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # ECR Repository for table populator image
+  TablePopulatorRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub 'reladiff-table-populator-${Environment}'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # ECS Task Definition for table population
+  TablePopulatorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'reladiff-table-populator-${Environment}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 4096
+      Memory: 16384
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !Ref TablePopulatorExecutionRole
+      TaskRoleArn: !Ref TablePopulatorTaskRole
+      ContainerDefinitions:
+        - Name: table-populator
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${TablePopulatorRepository}:latest'
+          Essential: true
+          Environment:
+            - Name: RESULTS_S3_BUCKET
+              Value: !Ref BenchmarkResultsBucket
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TablePopulatorLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # CloudWatch Log Group for ECS tasks
+  TablePopulatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/reladiff-table-populator-${Environment}'
+      RetentionInDays: 7
+
+  # ECS Task Execution Role
+  TablePopulatorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+
+  # ECS Task Role
+  TablePopulatorTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${BenchmarkResultsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt BenchmarkResultsBucket.Arn
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+
+  # Benchmark Executor Lambda Function
+  BenchmarkExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'reladiff-benchmark-executor-${Environment}'
+      CodeUri: lambda/
+      Handler: simple_benchmark_executor.lambda_handler
+      Environment:
+        Variables:
+          RESULTS_S3_BUCKET: !Ref BenchmarkResultsBucket
+          N_SAMPLES: 1000000
+          N_THREADS: 16
+      Policies:
+        - S3FullAccessPolicy:
+            BucketName: !Ref BenchmarkResultsBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:DescribeSecret
+              Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+
+Outputs:
+  ResultsBucket:
+    Description: 'S3 bucket for benchmark results'
+    Value: !Ref BenchmarkResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ResultsBucket'
+      
+  ECSClusterName:
+    Description: 'ECS Cluster name for table population'
+    Value: !Ref BenchmarkECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSCluster'
+      
+  TablePopulatorTaskDefinition:
+    Description: 'ECS Task Definition ARN for table populator'
+    Value: !Ref TablePopulatorTaskDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-TablePopulatorTaskDefinition'
+      
+  TablePopulatorRepository:
+    Description: 'ECR Repository for table populator'
+    Value: !Ref TablePopulatorRepository
+    Export:
+      Name: !Sub '${AWS::StackName}-TablePopulatorRepository'
+      
+  BenchmarkExecutorFunctionName:
+    Description: 'Benchmark Executor Lambda function name'
+    Value: !Ref BenchmarkExecutorFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-BenchmarkExecutorFunction'
